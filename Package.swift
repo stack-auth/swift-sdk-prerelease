@@ -1,6 +1,4 @@
 // swift-tools-version: 5.9
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
 import PackageDescription
 
 let package = Package(
@@ -9,26 +7,31 @@ let package = Package(
         .iOS(.v15),
         .macOS(.v12),
         .watchOS(.v8),
-        .tvOS(.v15)
+        .tvOS(.v15),
+        .visionOS(.v1)
     ],
     products: [
         .library(
             name: "StackAuth",
-            targets: ["StackAuth"]),
-        .executable(
-            name: "StackAuthExample",
-            targets: ["StackAuthExample"])
+            targets: ["StackAuth"]
+        ),
     ],
-    dependencies: [],
+    dependencies: [
+        // Cross-platform crypto (provides CryptoKit API on Linux)
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
+    ],
     targets: [
         .target(
             name: "StackAuth",
-            dependencies: []),
-        .executableTarget(
-            name: "StackAuthExample",
-            dependencies: ["StackAuth"]),
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto"),
+            ],
+            path: "Sources/StackAuth"
+        ),
         .testTarget(
             name: "StackAuthTests",
-            dependencies: ["StackAuth"]),
+            dependencies: ["StackAuth"],
+            path: "Tests/StackAuthTests"
+        ),
     ]
 )

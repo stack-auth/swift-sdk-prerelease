@@ -1,606 +1,266 @@
 import Foundation
 
-/// Server-side application class for Stack Auth with elevated privileges
-public class StackServerApp: StackClientApp {
-    private let secretServerKey: String
-
-    /// Initialize a new Stack server application
-    /// - Parameters:
-    ///   - projectId: Your Stack Auth project ID
-    ///   - publishableClientKey: Your publishable client key
-    ///   - secretServerKey: Your secret server key (keep this secure!)
-    ///   - baseURL: Base URL for the Stack Auth API (defaults to https://api.stack-auth.com)
-    ///   - tokenStoreType: Type of token storage to use (typically .none for server)
-    ///   - urls: Configuration URLs for redirects
-    ///   - extraHeaders: Additional headers to include in all requests
+/// Server-side Stack Auth client with elevated privileges
+public actor StackServerApp {
+    public let projectId: String
+    
+    let client: APIClient
+    
     public init(
         projectId: String,
         publishableClientKey: String,
         secretServerKey: String,
-        baseURL: URL = URL(string: "https://api.stack-auth.com")!,
-        tokenStoreType: TokenStoreType = .none,
-        urls: StackClientURLs = StackClientURLs(),
-        extraHeaders: [String: String] = [:]
+        baseUrl: String = "https://api.stack-auth.com"
     ) {
-        self.secretServerKey = secretServerKey
-
-        // Create a custom request builder with the secret server key
-        let serverRequestBuilder = RequestBuilder(
-            baseURL: baseURL,
+        self.projectId = projectId
+        
+        self.client = APIClient(
+            baseUrl: baseUrl,
             projectId: projectId,
             publishableClientKey: publishableClientKey,
             secretServerKey: secretServerKey,
-            extraHeaders: extraHeaders
-        )
-
-        // We need to call super.init but can't override the request builder
-        // So we'll init with a temporary one and replace it
-        super.init(
-            projectId: projectId,
-            publishableClientKey: publishableClientKey,
-            baseURL: baseURL,
-            tokenStoreType: tokenStoreType,
-            urls: urls,
-            extraHeaders: extraHeaders
+            tokenStore: NullTokenStore()
         )
     }
-
-    // MARK: - Server User Methods
-
-    /// Get a user by ID (server-only)
-    public func getUser(id: String) async throws -> ServerUser {
-        let user: BaseUser = try await apiClient.request(
-            path: "/users/\(id)",
-            method: "GET",
-            isServerOnly: true
-        )
-
-        return ServerUser(from: user, app: self)
-    }
-
-    /// List all users (server-only)
-    /// - Parameters:
-    ///   - cursor: Pagination cursor
-    ///   - limit: Maximum number of users to return
-    ///   - orderBy: Field to order by
-    ///   - desc: Whether to sort in descending order
+    
+    // MARK: - Users
+    
     public func listUsers(
-        cursor: String? = nil,
         limit: Int? = nil,
+        cursor: String? = nil,
         orderBy: String? = nil,
-        desc: Bool? = nil
-    ) async throws -> UsersList {
-        var queryItems: [URLQueryItem] = []
-
-        if let cursor = cursor {
-            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        descending: Bool? = nil
+    ) async throws -> PaginatedResult<ServerUser> {
+        var query: [String] = []
+        if let limit = limit { query.append("limit=\(limit)") }
+        if let cursor = cursor { query.append("cursor=\(cursor)") }
+        if let orderBy = orderBy { query.append("order_by=\(orderBy)") }
+        if let desc = descending { query.append("desc=\(desc)") }
+        
+        var path = "/users"
+        if !query.isEmpty {
+            path += "?" + query.joined(separator: "&")
         }
-        if let limit = limit {
-            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
-        }
-        if let orderBy = orderBy {
-            queryItems.append(URLQueryItem(name: "orderBy", value: orderBy))
-        }
-        if let desc = desc {
-            queryItems.append(URLQueryItem(name: "desc", value: String(desc)))
-        }
-
-        struct UsersListResponse: Decodable {
-            let users: [BaseUser]
-            let nextCursor: String?
-        }
-
-        let response: UsersListResponse = try await apiClient.request(
-            path: "/users",
+        
+        let (data, _) = try await client.sendRequest(
+            path: path,
             method: "GET",
-            queryItems: queryItems.isEmpty ? nil : queryItems,
-            isServerOnly: true
+            serverOnly: true
         )
-
-        let serverUsers = response.users.map { ServerUser(from: $0, app: self) }
-        return UsersList(users: serverUsers, nextCursor: response.nextCursor)
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["items"] as? [[String: Any]] else {
+            return PaginatedResult(items: [], pagination: Pagination(hasPreviousPage: false, hasNextPage: false, startCursor: nil, endCursor: nil))
+        }
+        
+        let pagination = parsePagination(from: json)
+        return PaginatedResult(
+            items: items.map { ServerUser(client: client, json: $0) },
+            pagination: pagination
+        )
     }
-
-    /// Create a new user (server-only)
+    
+    public func getUser(id userId: String) async throws -> ServerUser? {
+        do {
+            let (data, _) = try await client.sendRequest(
+                path: "/users/\(userId)",
+                method: "GET",
+                serverOnly: true
+            )
+            
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            
+            return ServerUser(client: client, json: json)
+        } catch let error as StackAuthErrorProtocol where error.code == "USER_NOT_FOUND" {
+            return nil
+        }
+    }
+    
     public func createUser(
         email: String? = nil,
         password: String? = nil,
         displayName: String? = nil,
-        profileImageUrl: String? = nil,
-        clientMetadata: [String: AnyCodable]? = nil,
-        serverMetadata: [String: AnyCodable]? = nil,
-        primaryEmailVerified: Bool = false
+        primaryEmailAuthEnabled: Bool = false,
+        primaryEmailVerified: Bool = false,
+        clientMetadata: [String: Any]? = nil,
+        serverMetadata: [String: Any]? = nil,
+        otpAuthEnabled: Bool = false,
+        totpSecretBase32: String? = nil,
+        selectedTeamId: String? = nil,
+        profileImageUrl: String? = nil
     ) async throws -> ServerUser {
         var body: [String: Any] = [:]
-
-        if let email = email {
-            body["email"] = email
-        }
-        if let password = password {
-            body["password"] = password
-        }
-        if let displayName = displayName {
-            body["displayName"] = displayName
-        }
-        if let profileImageUrl = profileImageUrl {
-            body["profileImageUrl"] = profileImageUrl
-        }
-        if let clientMetadata = clientMetadata {
-            body["clientMetadata"] = clientMetadata
-        }
-        if let serverMetadata = serverMetadata {
-            body["serverMetadata"] = serverMetadata
-        }
-        body["primaryEmailVerified"] = primaryEmailVerified
-
-        let user: BaseUser = try await apiClient.request(
+        if let email = email { body["primary_email"] = email }
+        if let password = password { body["password"] = password }
+        if let displayName = displayName { body["display_name"] = displayName }
+        body["primary_email_auth_enabled"] = primaryEmailAuthEnabled
+        body["primary_email_verified"] = primaryEmailVerified
+        if let clientMetadata = clientMetadata { body["client_metadata"] = clientMetadata }
+        if let serverMetadata = serverMetadata { body["server_metadata"] = serverMetadata }
+        body["otp_auth_enabled"] = otpAuthEnabled
+        if let totp = totpSecretBase32 { body["totp_secret_base32"] = totp }
+        if let teamId = selectedTeamId { body["selected_team_id"] = teamId }
+        if let url = profileImageUrl { body["profile_image_url"] = url }
+        
+        let (data, _) = try await client.sendRequest(
             path: "/users",
             method: "POST",
             body: body,
-            isServerOnly: true
+            serverOnly: true
         )
-
-        return ServerUser(from: user, app: self)
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw StackAuthError(code: "parse_error", message: "Failed to parse user response")
+        }
+        
+        return ServerUser(client: client, json: json)
     }
-
-    // MARK: - Server Team Methods
-
-    /// Get a team by ID (server-only)
-    public func getTeam(id: String) async throws -> ServerTeam {
-        let team: Team = try await apiClient.request(
-            path: "/teams/\(id)",
-            method: "GET",
-            isServerOnly: true
-        )
-
-        return ServerTeam(from: team, app: self)
-    }
-
-    /// List all teams (server-only)
+    
+    // MARK: - Teams
+    
     public func listTeams(
-        cursor: String? = nil,
-        limit: Int? = nil,
-        orderBy: String? = nil,
-        desc: Bool? = nil
-    ) async throws -> TeamsList {
-        var queryItems: [URLQueryItem] = []
-
-        if let cursor = cursor {
-            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        userId: String? = nil
+    ) async throws -> [ServerTeam] {
+        var query: [String] = []
+        if let userId = userId { query.append("user_id=\(userId)") }
+        
+        var path = "/teams"
+        if !query.isEmpty {
+            path += "?" + query.joined(separator: "&")
         }
-        if let limit = limit {
-            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
-        }
-        if let orderBy = orderBy {
-            queryItems.append(URLQueryItem(name: "orderBy", value: orderBy))
-        }
-        if let desc = desc {
-            queryItems.append(URLQueryItem(name: "desc", value: String(desc)))
-        }
-
-        struct TeamsListResponse: Decodable {
-            let teams: [Team]
-            let nextCursor: String?
-        }
-
-        let response: TeamsListResponse = try await apiClient.request(
-            path: "/teams",
+        
+        let (data, _) = try await client.sendRequest(
+            path: path,
             method: "GET",
-            queryItems: queryItems.isEmpty ? nil : queryItems,
-            isServerOnly: true
+            serverOnly: true
         )
-
-        let serverTeams = response.teams.map { ServerTeam(from: $0, app: self) }
-        return TeamsList(teams: serverTeams, nextCursor: response.nextCursor)
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["items"] as? [[String: Any]] else {
+            return []
+        }
+        
+        return items.map { ServerTeam(client: client, json: $0) }
     }
-
-    /// Create a new team (server-only)
+    
+    public func getTeam(id teamId: String) async throws -> ServerTeam? {
+        do {
+            let (data, _) = try await client.sendRequest(
+                path: "/teams/\(teamId)",
+                method: "GET",
+                serverOnly: true
+            )
+            
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            
+            return ServerTeam(client: client, json: json)
+        } catch let error as StackAuthErrorProtocol where error.code == "TEAM_NOT_FOUND" {
+            return nil
+        }
+    }
+    
     public func createTeam(
         displayName: String,
         creatorUserId: String? = nil,
-        description: String? = nil,
         profileImageUrl: String? = nil,
-        clientMetadata: [String: AnyCodable]? = nil,
-        serverMetadata: [String: AnyCodable]? = nil
+        clientMetadata: [String: Any]? = nil,
+        serverMetadata: [String: Any]? = nil
     ) async throws -> ServerTeam {
-        var body: [String: Any] = ["displayName": displayName]
-
-        if let creatorUserId = creatorUserId {
-            body["creatorUserId"] = creatorUserId
-        }
-        if let description = description {
-            body["description"] = description
-        }
-        if let profileImageUrl = profileImageUrl {
-            body["profileImageUrl"] = profileImageUrl
-        }
-        if let clientMetadata = clientMetadata {
-            body["clientMetadata"] = clientMetadata
-        }
-        if let serverMetadata = serverMetadata {
-            body["serverMetadata"] = serverMetadata
-        }
-
-        let team: Team = try await apiClient.request(
+        var body: [String: Any] = ["display_name": displayName]
+        if let creatorId = creatorUserId { body["creator_user_id"] = creatorId }
+        if let url = profileImageUrl { body["profile_image_url"] = url }
+        if let clientMeta = clientMetadata { body["client_metadata"] = clientMeta }
+        if let serverMeta = serverMetadata { body["server_metadata"] = serverMeta }
+        
+        let (data, _) = try await client.sendRequest(
             path: "/teams",
             method: "POST",
             body: body,
-            isServerOnly: true
+            serverOnly: true
         )
-
-        return ServerTeam(from: team, app: self)
-    }
-
-    // MARK: - Server Product Methods
-
-    /// Grant a product to a customer (server-only)
-    public func grantProduct(
-        customerId: String,
-        customerType: String = "user",
-        productId: String,
-        quantity: Int = 1
-    ) async throws {
-        try await apiClient.requestVoid(
-            path: "/customers/\(customerType)/\(customerId)/products/\(productId)/grant",
-            method: "POST",
-            body: ["quantity": quantity],
-            isServerOnly: true
-        )
-    }
-
-    /// Get an item for a customer (server-only)
-    public func getItem(customerId: String, customerType: String = "user", itemId: String) async throws -> ServerItem {
-        let item: Item = try await apiClient.request(
-            path: "/customers/\(customerType)/\(customerId)/items/\(itemId)",
-            method: "GET",
-            isServerOnly: true
-        )
-
-        let serverItem = ServerItem(from: item, app: self, customerId: customerId, customerType: customerType)
-        return serverItem
-    }
-
-    /// List products for a customer (server-only)
-    public func listProducts(
-        customerId: String,
-        customerType: String = "user",
-        cursor: String? = nil,
-        limit: Int? = nil
-    ) async throws -> CustomerProductsList {
-        var queryItems: [URLQueryItem] = []
-
-        if let cursor = cursor {
-            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw StackAuthError(code: "parse_error", message: "Failed to parse team response")
         }
-        if let limit = limit {
-            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
-        }
-
-        return try await apiClient.request(
-            path: "/customers/\(customerType)/\(customerId)/products",
-            method: "GET",
-            queryItems: queryItems.isEmpty ? nil : queryItems,
-            isServerOnly: true
-        )
+        
+        return ServerTeam(client: client, json: json)
     }
-
-    // MARK: - Email Methods
-
-    /// Send an email (server-only)
-    public func sendEmail(
-        to: String,
-        subject: String,
-        body: String,
-        from: String? = nil,
-        replyTo: String? = nil
-    ) async throws {
-        var emailBody: [String: Any] = [
-            "to": to,
-            "subject": subject,
-            "body": body
+    
+    // MARK: - Project
+    
+    public func getProject() async throws -> Project {
+        let (data, _) = try await client.sendRequest(
+            path: "/projects/current",
+            method: "GET",
+            serverOnly: true
+        )
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw StackAuthError(code: "parse_error", message: "Failed to parse project response")
+        }
+        
+        return Project(from: json)
+    }
+    
+    // MARK: - Create Session (Impersonation)
+    
+    public func createSession(userId: String, expiresInSeconds: Int = 3600) async throws -> SessionTokens {
+        let body: [String: Any] = [
+            "user_id": userId,
+            "expires_in_millis": expiresInSeconds * 1000
         ]
-
-        if let from = from {
-            emailBody["from"] = from
-        }
-        if let replyTo = replyTo {
-            emailBody["replyTo"] = replyTo
-        }
-
-        try await apiClient.requestVoid(
-            path: "/emails/send",
-            method: "POST",
-            body: emailBody,
-            isServerOnly: true
-        )
-    }
-
-    /// Get email delivery statistics (server-only)
-    public func getEmailDeliveryStats(
-        startDate: Date? = nil,
-        endDate: Date? = nil
-    ) async throws -> EmailDeliveryStats {
-        var queryItems: [URLQueryItem] = []
-
-        if let startDate = startDate {
-            let formatter = ISO8601DateFormatter()
-            queryItems.append(URLQueryItem(name: "startDate", value: formatter.string(from: startDate)))
-        }
-        if let endDate = endDate {
-            let formatter = ISO8601DateFormatter()
-            queryItems.append(URLQueryItem(name: "endDate", value: formatter.string(from: endDate)))
-        }
-
-        return try await apiClient.request(
-            path: "/emails/stats",
-            method: "GET",
-            queryItems: queryItems.isEmpty ? nil : queryItems,
-            isServerOnly: true
-        )
-    }
-
-    // MARK: - OAuth Provider Methods
-
-    /// Create an OAuth provider configuration (server-only)
-    public func createOAuthProvider(
-        type: String,
-        clientId: String,
-        clientSecret: String,
-        scopes: [String]? = nil,
-        enabled: Bool = true
-    ) async throws -> OAuthProviderConfig {
-        var body: [String: Any] = [
-            "type": type,
-            "clientId": clientId,
-            "clientSecret": clientSecret,
-            "enabled": enabled
-        ]
-
-        if let scopes = scopes {
-            body["scopes"] = scopes
-        }
-
-        return try await apiClient.request(
-            path: "/oauth-providers",
+        
+        let (data, _) = try await client.sendRequest(
+            path: "/auth/sessions",
             method: "POST",
             body: body,
-            isServerOnly: true
+            serverOnly: true
+        )
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = json["access_token"] as? String,
+              let refreshToken = json["refresh_token"] as? String else {
+            throw StackAuthError(code: "parse_error", message: "Failed to parse session response")
+        }
+        
+        return SessionTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken
         )
     }
-
-    // MARK: - Data Vault Methods
-
-    /// Get a data vault store instance (server-only)
-    public func getDataVaultStore() -> DataVaultStore {
-        return DataVaultStore(app: self)
+    
+    // MARK: - Helpers
+    
+    private func parsePagination(from json: [String: Any]) -> Pagination {
+        let pagination = json["pagination"] as? [String: Any] ?? [:]
+        return Pagination(
+            hasPreviousPage: pagination["has_previous_page"] as? Bool ?? false,
+            hasNextPage: pagination["has_next_page"] as? Bool ?? false,
+            startCursor: pagination["start_cursor"] as? String,
+            endCursor: pagination["end_cursor"] as? String
+        )
     }
 }
 
 // MARK: - Supporting Types
 
-/// Server user with additional server-only methods
-public class ServerUser: CurrentUser {
-    weak var serverApp: StackServerApp? {
-        return app as? StackServerApp
-    }
-
-    public init(from user: BaseUser, app: StackServerApp) {
-        super.init(from: user, app: app)
-    }
-
-    required init(from decoder: Decoder) throws {
-        try super.init(from: decoder)
-    }
-
-    /// Update server metadata (server-only)
-    public func updateServerMetadata(_ metadata: [String: AnyCodable]) async throws {
-        guard let app = serverApp else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/users/\(id)",
-            method: "PATCH",
-            body: ["serverMetadata": metadata],
-            isServerOnly: true
-        )
-    }
-
-    /// Delete user (server-only)
-    public func deleteUser() async throws {
-        guard let app = serverApp else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/users/\(id)",
-            method: "DELETE",
-            isServerOnly: true
-        )
-    }
+public struct PaginatedResult<T: Sendable>: Sendable {
+    public let items: [T]
+    public let pagination: Pagination
 }
 
-/// Server team with additional server-only methods
-public class ServerTeam {
-    public let team: Team
-    weak var app: StackServerApp?
-
-    public init(from team: Team, app: StackServerApp) {
-        self.team = team
-        self.app = app
-    }
-
-    public var id: String { team.id }
-    public var displayName: String { team.displayName }
-    public var description: String? { team.description }
-    public var profileImageUrl: String? { team.profileImageUrl }
-    public var createdAt: Date { team.createdAt }
-    public var updatedAt: Date { team.updatedAt }
-    public var createdBy: String { team.createdBy }
-    public var clientMetadata: [String: AnyCodable]? { team.clientMetadata }
-    public var serverMetadata: [String: AnyCodable]? { team.serverMetadata }
-    public var members: [TeamMember] { team.members }
-    public var invitations: [TeamInvitation] { team.invitations }
-
-    /// Update server metadata (server-only)
-    public func updateServerMetadata(_ metadata: [String: AnyCodable]) async throws {
-        guard let app = app else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/teams/\(id)",
-            method: "PATCH",
-            body: ["serverMetadata": metadata],
-            isServerOnly: true
-        )
-    }
-
-    /// Delete team (server-only)
-    public func deleteTeam() async throws {
-        guard let app = app else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/teams/\(id)",
-            method: "DELETE",
-            isServerOnly: true
-        )
-    }
-
-    /// Add a user to the team (server-only)
-    public func addUser(_ userId: String, role: String = "member") async throws {
-        guard let app = app else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/teams/\(id)/users/\(userId)",
-            method: "POST",
-            body: ["role": role],
-            isServerOnly: true
-        )
-    }
-
-    /// Remove a user from the team (server-only)
-    public func removeUser(_ userId: String) async throws {
-        guard let app = app else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/teams/\(id)/users/\(userId)",
-            method: "DELETE",
-            isServerOnly: true
-        )
-    }
+public struct Pagination: Sendable {
+    public let hasPreviousPage: Bool
+    public let hasNextPage: Bool
+    public let startCursor: String?
+    public let endCursor: String?
 }
 
-/// List of users with pagination
-public struct UsersList {
-    public let users: [ServerUser]
-    public let nextCursor: String?
-
-    public init(users: [ServerUser], nextCursor: String?) {
-        self.users = users
-        self.nextCursor = nextCursor
-    }
-}
-
-/// List of teams with pagination
-public struct TeamsList {
-    public let teams: [ServerTeam]
-    public let nextCursor: String?
-
-    public init(teams: [ServerTeam], nextCursor: String?) {
-        self.teams = teams
-        self.nextCursor = nextCursor
-    }
-}
-
-/// Email delivery statistics
-public struct EmailDeliveryStats: Codable {
-    public let sent: Int
-    public let delivered: Int
-    public let bounced: Int
-    public let opened: Int
-    public let clicked: Int
-    public let failed: Int
-
-    public init(
-        sent: Int,
-        delivered: Int,
-        bounced: Int,
-        opened: Int,
-        clicked: Int,
-        failed: Int
-    ) {
-        self.sent = sent
-        self.delivered = delivered
-        self.bounced = bounced
-        self.opened = opened
-        self.clicked = clicked
-        self.failed = failed
-    }
-}
-
-/// Data vault store for secure key-value storage
-public class DataVaultStore {
-    weak var app: StackServerApp?
-
-    init(app: StackServerApp) {
-        self.app = app
-    }
-
-    /// Get a value from the data vault
-    public func get(key: String) async throws -> String? {
-        guard let app = app else { return nil }
-
-        struct ValueResponse: Decodable {
-            let value: String?
-        }
-
-        let response: ValueResponse = try await app.apiClient.request(
-            path: "/data-vault/\(key)",
-            method: "GET",
-            isServerOnly: true
-        )
-
-        return response.value
-    }
-
-    /// Set a value in the data vault
-    public func set(key: String, value: String) async throws {
-        guard let app = app else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/data-vault/\(key)",
-            method: "PUT",
-            body: ["value": value],
-            isServerOnly: true
-        )
-    }
-
-    /// Delete a value from the data vault
-    public func delete(key: String) async throws {
-        guard let app = app else { return }
-
-        try await app.apiClient.requestVoid(
-            path: "/data-vault/\(key)",
-            method: "DELETE",
-            isServerOnly: true
-        )
-    }
-
-    /// List all keys in the data vault
-    public func listKeys(prefix: String? = nil) async throws -> [String] {
-        guard let app = app else { return [] }
-
-        var queryItems: [URLQueryItem] = []
-        if let prefix = prefix {
-            queryItems.append(URLQueryItem(name: "prefix", value: prefix))
-        }
-
-        struct KeysResponse: Decodable {
-            let keys: [String]
-        }
-
-        let response: KeysResponse = try await app.apiClient.request(
-            path: "/data-vault/keys",
-            method: "GET",
-            queryItems: queryItems.isEmpty ? nil : queryItems,
-            isServerOnly: true
-        )
-
-        return response.keys
-    }
+public struct SessionTokens: Sendable {
+    public let accessToken: String
+    public let refreshToken: String
 }
